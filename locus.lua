@@ -1,8 +1,9 @@
 --[[ =========================================================================
- LOCUS v2.1 - behavior audit tool for Vykus / PolSec-style protections
+ LOCUS v2.1.1 - behavior audit tool for Vykus / PolSec-style protections
 ============================================================================
 (formerly ENV-LOGGER v1.0; dump folder renamed envlog/ -> locus/)
 (v2.1: GUI launcher - enter the target in the GUI, press EXECUTE AUDIT)
+(v2.1.1: GUI fallback fix, dump verification fix, hardened banner/fetch)
 
 Runs a protected script (or its loader) inside an instrumented environment
 and records everything it touches:
@@ -123,7 +124,8 @@ local function realHttpGet(url)
   end
   if realType(G.io) == "table" and realType(G.io.popen) == "function" then
     local ok, res = pcall_(function()
-      local fh = G.io.popen("curl -sL " .. url)
+      -- quote the url so &, spaces and shell metacharacters survive curl
+      local fh = G.io.popen("curl -sL \"" .. url .. "\"")
       if not fh then return nil end
       local out = fh:read("*a")
       fh:close()
@@ -176,7 +178,7 @@ local function runAudit(cfg)
   -- ------------------------------- banner ----------------------------------
 
   P("========================================================================")
-  P(" LOCUS v2.1 - behavior audit tool for Vykus / PolSec-style protections")
+  P(" LOCUS v2.1.1 - behavior audit tool for Vykus / PolSec-style protections")
   P("========================================================================")
   P("  * every global read / write  ->  ENV[read] key (count) / ENV[write]")
   P("  * loadstring / load calls    ->  full source dumped to a file")
@@ -189,8 +191,13 @@ local function runAudit(cfg)
   P(" files   : " .. ((HAS_LFS and ("writefile -> workspace/" .. LOG_DIR .. "/"))
     or ((HAS_IO and ("io.open -> ./" .. LOG_DIR .. "/")) or "NO FILE API (dumps disabled)")))
   P(" namecall: " .. ((EXEC and CAN_HOOK) and "hook available" or "not available"))
-  P(" executor : " .. ((realType(rawget_(G, "identifyexecutor")) == "function")
-    and rawget_(G, "identifyexecutor")() or "unknown"))
+  -- identifyexecutor() is executor-provided and may itself error: keep it pcall'd
+  local execName = "unknown"
+  if realType(rawget_(G, "identifyexecutor")) == "function" then
+    local okE, nameE = pcall_(rawget_(G, "identifyexecutor"))
+    if okE and realType(nameE) == "string" and #nameE > 0 then execName = nameE end
+  end
+  P(" executor : " .. execName)
   P(" extras  : leak scan = " .. tostring_(SCAN_LEAKS)
     .. ", remote capture = " .. tostring_(CAPTURE_REMOTES))
   P(" OFFLINE : " .. tostring_(OFFLINE))
@@ -205,8 +212,9 @@ local function runAudit(cfg)
     if dirTried then return end
     dirTried = true
     if realType(G.os) == "table" and realType(G.os.execute) == "function" then
-      pcall_(G.os.execute, "mkdir -p " .. LOG_DIR)
-      pcall_(G.os.execute, "mkdir " .. LOG_DIR)
+      -- quoted paths: tolerate spaces in LOG_DIR, and cover sh (-p) and cmd
+      pcall_(G.os.execute, 'mkdir -p "' .. LOG_DIR .. '"')
+      pcall_(G.os.execute, 'mkdir "' .. LOG_DIR .. '"')
     end
   end
 
@@ -233,7 +241,9 @@ local function runAudit(cfg)
     end
     if not ok and HAS_IO then
       ensureDir()
-      ok = pcall_(function()
+      -- pcall returns (true, false) when the inner function returns false:
+      -- capture BOTH returns so a failed open is not reported as a success
+      local called, opened = pcall_(function()
         local fh = G.io.open(full, "w")
         if not fh then fh = G.io.open(flat, "w") end
         if not fh then return false end
@@ -241,6 +251,7 @@ local function runAudit(cfg)
         fh:close()
         return true
       end)
+      ok = (called == true) and (opened == true)
       if ok then
         local fh2 = G.io.open(full, "r")
         if fh2 then fh2:close() else where = flat end
@@ -323,9 +334,9 @@ local function runAudit(cfg)
       local ok, r = pcall_(realSetfenv, f, env)
       if ok and realType(r) == "function" then return r end
     end
-    local ok2, f2 = pcall_(realLoad, src, cname, env)       -- Lua 5.2 / Luau load env
+    local ok2, f2 = pcall_(realLoad, src, cname, "t", env)  -- Lua 5.2/5.3/5.4 mode+env
     if ok2 and realType(f2) == "function" then return f2 end
-    local ok3, f3 = pcall_(realLoad, src, cname, "t", env)  -- Lua 5.3 / 5.4 mode+env
+    local ok3, f3 = pcall_(realLoad, src, cname, env)       -- Luau-style load(src, name, env)
     if ok3 and realType(f3) == "function" then return f3 end
     isolationLeak = true -- could not bind: this chunk runs on raw globals
     return f
@@ -820,7 +831,7 @@ local function buildGUI(runAudit)
   local bar = mk("Frame", { Size = UDim2.new(1, 0, 0, 34), BackgroundColor3 = C_PANEL, BorderSizePixel = 0 }, root)
   mk("TextLabel", {
     Size = UDim2.new(1, -44, 1, 0), Position = UDim2.new(0, 10, 0, 0),
-    BackgroundTransparency = 1, Text = "LOCUS v2.1 - audit launcher",
+    BackgroundTransparency = 1, Text = "LOCUS v2.1.1 - audit launcher",
     TextColor3 = C_ACC, Font = FONT, TextSize = 16, TextXAlignment = EnumT.TextXAlignment.Left,
   }, bar)
   mk("TextButton", {
@@ -1001,9 +1012,12 @@ end
 realPrint("[locus] loading LOCUS v2.1.1 ...")
 
 if EXEC then
-  local okG, gerr = pcall_(buildGUI, runAudit)
-  if not okG then
-    realPrint("[locus] GUI unavailable (" .. tostring_(gerr) .. ") - running a default audit instead")
+  -- buildGUI signals graceful failure with (false, reason); pcall itself only
+  -- fails on a hard error. Check BOTH, or the fallback run never happens.
+  local okG, guiOk, greason = pcall_(buildGUI, runAudit)
+  if not okG or not guiOk then
+    realPrint("[locus] GUI unavailable ("
+      .. tostring_(okG and greason or guiOk) .. ") - running a default audit instead")
     return runAudit(nil) -- GUI failed; default run
   end
   realPrint("[locus] GUI loaded - enter the target and press EXECUTE AUDIT")
