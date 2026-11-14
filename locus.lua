@@ -1,9 +1,8 @@
 --[[ =========================================================================
- LOCUS v2.1.1 - behavior audit tool for Vykus / PolSec-style protections
+ LOCUS v2.1.2 - behavior audit tool for Vykus / PolSec-style protections
 ============================================================================
 (formerly ENV-LOGGER v1.0; dump folder renamed envlog/ -> locus/)
 (v2.1: GUI launcher - enter the target in the GUI, press EXECUTE AUDIT)
-(v2.1.1: GUI fallback fix, dump verification fix, hardened banner/fetch)
 
 Runs a protected script (or its loader) inside an instrumented environment
 and records everything it touches:
@@ -74,28 +73,54 @@ Honest residuals (what this harness does not catch):
 
 local G = _G
 
-local realType   = G.type
-local rawget_    = G.rawget
-local tinsert    = G.table.insert
-local tconcat    = G.table.concat
-local sfind      = G.string.find
-local format     = G.string.format
-local sub        = G.string.sub
-local realPrint  = G.print
-local pcall_     = G.pcall
-local tostring_  = G.tostring
-local pairs_     = G.pairs
-local ipairs_    = G.ipairs
+local realType   = type
+local rawget_    = rawget
+local tinsert    = table.insert
+local tconcat    = table.concat
+local sfind      = string.find
+local format     = string.format
+local sub        = string.sub
+local realPrint  = print
+local pcall_     = pcall
+local tostring_  = tostring
+local pairs_     = pairs
+local ipairs_    = ipairs
 
-local realLoad       = G.load
-local realLoadstring = rawget_(G, "loadstring") or G.load
-local realSetfenv    = rawget_(G, "setfenv")
+local realLoad       = load
+local realLoadstring = loadstring or load
+local realSetfenv    = setfenv
 
-local EXEC     = (realType(G.game) ~= "nil")            -- Roblox executor / Luau host
-local HAS_LFS  = (realType(G.writefile) == "function") -- executor file API
-local HAS_IO   = (realType(G.io) == "table" and realType(G.io.open) == "function")
-local CAN_HOOK = (realType(G.hookmetamethod) == "function")
-             and (realType(G.getnamecallmethod) == "function")
+local EXEC     = (realType(game) ~= "nil")            -- Roblox executor / Luau host
+local HAS_LFS  = (realType(writefile) == "function") -- executor file API
+local HAS_IO   = (realType(io) == "table" and realType(io.open) == "function")
+local CAN_HOOK = (realType(hookmetamethod) == "function")
+             and (realType(getnamecallmethod) == "function")
+
+-- Roblox/executor environments do NOT expose the standard libraries through
+-- _G (desktop Lua does). The proxy env falls back to this table first, so
+-- audited targets still see table/string/math/game/task/... on Roblox.
+local FALLBACK = {
+  table = table, string = string, math = math, os = os, io = io,
+  coroutine = coroutine, bit32 = bit32, utf8 = utf8, task = task,
+  game = game, workspace = workspace, script = script,
+  Instance = Instance, Enum = Enum, UDim2 = UDim2, Color3 = Color3,
+  Vector3 = Vector3, Vector2 = Vector2, CFrame = CFrame, Ray = Ray,
+  warn = warn, typeof = typeof, tick = tick, wait = wait,
+  spawn = spawn, delay = delay, require = require,
+  tostring = tostring, tonumber = tonumber, pairs = pairs, ipairs = ipairs,
+  next = next, select = select, unpack = unpack, pcall = pcall,
+  xpcall = xpcall, setmetatable = setmetatable, getmetatable = getmetatable,
+  rawget = rawget, rawset = rawset, rawequal = rawequal, rawlen = rawlen,
+  assert = assert, error = error, type = type, print = print,
+  loadstring = loadstring, load = load, getfenv = getfenv, setfenv = setfenv,
+  getgenv = getgenv, hookmetamethod = hookmetamethod,
+  getnamecallmethod = getnamecallmethod, getrawmetatable = getrawmetatable,
+  setrawmetatable = setrawmetatable, newcclosure = newcclosure,
+  identifyexecutor = identifyexecutor, request = request,
+  http_request = http_request, writefile = writefile, readfile = readfile,
+  isfile = isfile, isfolder = isfolder, makefolder = makefolder,
+  delfile = delfile, delfolder = delfolder, listfiles = listfiles,
+}
 
 local PLACEHOLDER = [[
 -- paste the protected script / loader here (or use SOURCE MODE: URL in the GUI)
@@ -110,22 +135,21 @@ local function realHttpGet(url)
   if EXEC then
     local ok, res = pcall_(function() return game:HttpGet(url) end)
     if ok and realType(res) == "string" then return res end
-    if realType(G.http) == "table" and realType(G.http.get) == "function" then
-      local ok2, res2 = pcall_(G.http.get, url)
+    if realType(http) == "table" and realType(http.get) == "function" then
+      local ok2, res2 = pcall_(http.get, url)
       if ok2 and realType(res2) == "string" then return res2 end
     end
-    if realType(rawget_(G, "request")) == "function" then
-      local ok3, res3 = pcall_(G.request, { Url = url, Method = "GET" })
+    if realType(request) == "function" then
+      local ok3, res3 = pcall_(request, { Url = url, Method = "GET" })
       if ok3 and realType(res3) == "table" and realType(res3.Body) == "string" then
         return res3.Body
       end
     end
     return nil, "no http API available in this executor"
   end
-  if realType(G.io) == "table" and realType(G.io.popen) == "function" then
+  if realType(io) == "table" and realType(io.popen) == "function" then
     local ok, res = pcall_(function()
-      -- quote the url so &, spaces and shell metacharacters survive curl
-      local fh = G.io.popen("curl -sL \"" .. url .. "\"")
+      local fh = io.popen("curl -sL " .. url)
       if not fh then return nil end
       local out = fh:read("*a")
       fh:close()
@@ -178,7 +202,7 @@ local function runAudit(cfg)
   -- ------------------------------- banner ----------------------------------
 
   P("========================================================================")
-  P(" LOCUS v2.1.1 - behavior audit tool for Vykus / PolSec-style protections")
+  P(" LOCUS v2.1.2 - behavior audit tool for Vykus / PolSec-style protections")
   P("========================================================================")
   P("  * every global read / write  ->  ENV[read] key (count) / ENV[write]")
   P("  * loadstring / load calls    ->  full source dumped to a file")
@@ -191,13 +215,8 @@ local function runAudit(cfg)
   P(" files   : " .. ((HAS_LFS and ("writefile -> workspace/" .. LOG_DIR .. "/"))
     or ((HAS_IO and ("io.open -> ./" .. LOG_DIR .. "/")) or "NO FILE API (dumps disabled)")))
   P(" namecall: " .. ((EXEC and CAN_HOOK) and "hook available" or "not available"))
-  -- identifyexecutor() is executor-provided and may itself error: keep it pcall'd
-  local execName = "unknown"
-  if realType(rawget_(G, "identifyexecutor")) == "function" then
-    local okE, nameE = pcall_(rawget_(G, "identifyexecutor"))
-    if okE and realType(nameE) == "string" and #nameE > 0 then execName = nameE end
-  end
-  P(" executor : " .. execName)
+  P(" executor : " .. ((realType(identifyexecutor) == "function")
+    and identifyexecutor() or "unknown"))
   P(" extras  : leak scan = " .. tostring_(SCAN_LEAKS)
     .. ", remote capture = " .. tostring_(CAPTURE_REMOTES))
   P(" OFFLINE : " .. tostring_(OFFLINE))
@@ -211,10 +230,9 @@ local function runAudit(cfg)
   local function ensureDir()
     if dirTried then return end
     dirTried = true
-    if realType(G.os) == "table" and realType(G.os.execute) == "function" then
-      -- quoted paths: tolerate spaces in LOG_DIR, and cover sh (-p) and cmd
-      pcall_(G.os.execute, 'mkdir -p "' .. LOG_DIR .. '"')
-      pcall_(G.os.execute, 'mkdir "' .. LOG_DIR .. '"')
+    if realType(os) == "table" and realType(os.execute) == "function" then
+      pcall_(os.execute, "mkdir -p " .. LOG_DIR)
+      pcall_(os.execute, "mkdir " .. LOG_DIR)
     end
   end
 
@@ -223,17 +241,17 @@ local function runAudit(cfg)
     local flat = LOG_DIR .. "_" .. name
     local ok, where = false, full
     if HAS_LFS then
-      if realType(G.isfolder) == "function" and realType(G.makefolder) == "function"
-        and not G.isfolder(LOG_DIR) then
-        pcall_(G.makefolder, LOG_DIR)
+      if realType(isfolder) == "function" and realType(makefolder) == "function"
+        and not isfolder(LOG_DIR) then
+        pcall_(makefolder, LOG_DIR)
       end
-      pcall_(G.writefile, full, content)
-      if realType(G.isfile) == "function" then
-        if G.isfile(full) then
+      pcall_(writefile, full, content)
+      if realType(isfile) == "function" then
+        if isfile(full) then
           ok = true
         else
-          pcall_(G.writefile, flat, content)
-          if G.isfile(flat) then ok, where = true, flat end
+          pcall_(writefile, flat, content)
+          if isfile(flat) then ok, where = true, flat end
         end
       else
         ok = true -- no isfile to verify with; assume the pcall wrote it
@@ -241,19 +259,16 @@ local function runAudit(cfg)
     end
     if not ok and HAS_IO then
       ensureDir()
-      -- pcall returns (true, false) when the inner function returns false:
-      -- capture BOTH returns so a failed open is not reported as a success
-      local called, opened = pcall_(function()
-        local fh = G.io.open(full, "w")
-        if not fh then fh = G.io.open(flat, "w") end
+      ok = pcall_(function()
+        local fh = io.open(full, "w")
+        if not fh then fh = io.open(flat, "w") end
         if not fh then return false end
         fh:write(content)
         fh:close()
         return true
       end)
-      ok = (called == true) and (opened == true)
       if ok then
-        local fh2 = G.io.open(full, "r")
+        local fh2 = io.open(full, "r")
         if fh2 then fh2:close() else where = flat end
       end
     end
@@ -303,6 +318,8 @@ local function runAudit(cfg)
       readCounts[k] = (readCounts[k] or 0) + 1
       local v = backing[k]
       if v ~= nil then return v end
+      local fb = FALLBACK[k]
+      if fb ~= nil then return fb end
       return G[k]
     end,
     __newindex = function(_, k, v)
@@ -334,9 +351,9 @@ local function runAudit(cfg)
       local ok, r = pcall_(realSetfenv, f, env)
       if ok and realType(r) == "function" then return r end
     end
-    local ok2, f2 = pcall_(realLoad, src, cname, "t", env)  -- Lua 5.2/5.3/5.4 mode+env
+    local ok2, f2 = pcall_(realLoad, src, cname, env)       -- Lua 5.2 / Luau load env
     if ok2 and realType(f2) == "function" then return f2 end
-    local ok3, f3 = pcall_(realLoad, src, cname, env)       -- Luau-style load(src, name, env)
+    local ok3, f3 = pcall_(realLoad, src, cname, "t", env)  -- Lua 5.3 / 5.4 mode+env
     if ok3 and realType(f3) == "function" then return f3 end
     isolationLeak = true -- could not bind: this chunk runs on raw globals
     return f
@@ -350,7 +367,7 @@ local function runAudit(cfg)
   local function pad(s, n)
     s = tostring_(s)
     if #s >= n then return s end
-    return s .. G.string.rep(" ", n - #s)
+    return s .. string.rep(" ", n - #s)
   end
 
   -- leak scanner: plain string.find loops (no gsub; harness-safe)
@@ -516,32 +533,32 @@ local function runAudit(cfg)
 
   -- close the classic escape hatches so reads keep flowing through the proxy
   backing._G = env
-  if realType(rawget_(G, "getfenv")) == "function" then
+  if realType(getfenv) == "function" then
     backing.getfenv = function() return env end
   end
-  if realType(rawget_(G, "getgenv")) == "function" then
+  if realType(getgenv) == "function" then
     backing.getgenv = function() return env end
   end
 
   -- wrapped loaders everywhere; loadstring shim on 5.3/5.4 CLI
-  backing.loadstring = makeWrappedLoader(rawget_(G, "loadstring") or realLoad, "loadstring")
+  backing.loadstring = makeWrappedLoader(loadstring or realLoad, "loadstring")
   backing.load       = makeWrappedLoader(realLoad, "load")
 
-  if realType(rawget_(G, "request")) == "function" then
-    backing.request = wrapRequest(rawget_(G, "request"), "request")
+  if realType(request) == "function" then
+    backing.request = wrapRequest(request, "request")
   end
-  if realType(rawget_(G, "http_request")) == "function" then
-    backing.http_request = wrapRequest(rawget_(G, "http_request"), "http_request")
+  if realType(http_request) == "function" then
+    backing.http_request = wrapRequest(http_request, "http_request")
   end
-  if realType(rawget_(G, "http")) == "table" then
-    backing.http = proxyTable(G.http, "http", {
+  if realType(http) == "table" then
+    backing.http = proxyTable(http, "http", {
       request = function(r) return wrapRequest(r, "http.request") end,
       get     = function(r) return wrapGet(r, "http.get") end,
       post    = function(r) return wrapPost(r, "http.post") end,
     })
   end
-  if realType(rawget_(G, "syn")) == "table" then
-    backing.syn = proxyTable(G.syn, "syn", {
+  if realType(syn) == "table" then
+    backing.syn = proxyTable(syn, "syn", {
       request = function(r) return wrapRequest(r, "syn.request") end,
     })
   end
@@ -554,18 +571,18 @@ local function runAudit(cfg)
     if not (EXEC and CAN_HOOK) then return end
     -- capture the original __namecall BEFORE hooking, so we can pass through
     local okMT, mt = pcall_(function()
-      if realType(G.getrawmetatable) == "function" then return G.getrawmetatable(game) end
-      return G.getmetatable(game)
+      if realType(getrawmetatable) == "function" then return getrawmetatable(game) end
+      return getmetatable(game)
     end)
     local oldNamecall = (okMT and realType(mt) == "table") and mt.__namecall or nil
     if realType(oldNamecall) ~= "function" then return end
 
-    local okS, HTTP_SERVICE = pcall_(G.game.GetService, game, "HttpService")
+    local okS, HTTP_SERVICE = pcall_(game.GetService, game, "HttpService")
     if not okS then HTTP_SERVICE = nil end
 
     local function hook(self, ...)
       local args = { ... }
-      local method = G.getnamecallmethod()
+      local method = getnamecallmethod()
       if self == game and (method == "HttpGet" or method == "HttpGetAsync") then
         noteHttp("game:" .. method, args[1], nil)
         if OFFLINE then return OFFLINE_BODY end
@@ -591,8 +608,8 @@ local function runAudit(cfg)
       return oldNamecall(self, ...)
     end
 
-    local hookFn = (realType(G.newcclosure) == "function") and G.newcclosure(hook) or hook
-    namecallHooked = pcall_(G.hookmetamethod, game, "__namecall", hookFn)
+    local hookFn = (realType(newcclosure) == "function") and newcclosure(hook) or hook
+    namecallHooked = pcall_(hookmetamethod, game, "__namecall", hookFn)
   end
 
   -- ------------------------------- run target ------------------------------
@@ -635,7 +652,7 @@ local function runAudit(cfg)
     local keys, seen = {}, {}
     for k in pairs_(readCounts) do tinsert(keys, k) seen[k] = true end
     for k in pairs_(writeCounts) do if not seen[k] then tinsert(keys, k) end end
-    G.table.sort(keys, function(x, y)
+    table.sort(keys, function(x, y)
       local cx, cy = (readCounts[x] or 0), (readCounts[y] or 0)
       if cx ~= cy then return cx > cy end
       return tostring_(x) < tostring_(y)
@@ -770,10 +787,10 @@ end
 -- Every buildGUI failure falls back to a default CLI-style run.
 
 local function buildGUI(runAudit)
-  local Inst  = rawget_(G, "Instance")
-  local EnumT = rawget_(G, "Enum")
-  local UDim2 = rawget_(G, "UDim2")
-  local Color3 = rawget_(G, "Color3")
+  local Inst  = Instance
+  local EnumT = Enum
+  local UDim2 = UDim2
+  local Color3 = Color3
   if realType(Inst) ~= "table" or realType(EnumT) ~= "table"
     or realType(UDim2) ~= "table" or realType(Color3) ~= "table" then
     return false, "Roblox GUI datatypes not available"
@@ -797,8 +814,8 @@ local function buildGUI(runAudit)
 
   -- parent: gethui() -> CoreGui -> PlayerGui
   local parented = false
-  if realType(rawget_(G, "gethui")) == "function" then
-    local okH, hui = pcall_(G.gethui)
+  if realType(gethui) == "function" then
+    local okH, hui = pcall_(gethui)
     if okH and hui then gui.Parent = hui; parented = true end
   end
   if not parented then
@@ -811,7 +828,7 @@ local function buildGUI(runAudit)
     end)
   end
   -- if every parent refused, say so loudly and fall back to a default run
-  -- instead of building a window nobody can see (silent no-op bug, fixed v2.1.1)
+  -- instead of building a window nobody can see (silent no-op bug, fixed v2.1.2)
   if gui.Parent == nil then
     gui:Destroy()
     return false, "could not display the GUI (gethui/CoreGui/PlayerGui all refused)"
@@ -831,7 +848,7 @@ local function buildGUI(runAudit)
   local bar = mk("Frame", { Size = UDim2.new(1, 0, 0, 34), BackgroundColor3 = C_PANEL, BorderSizePixel = 0 }, root)
   mk("TextLabel", {
     Size = UDim2.new(1, -44, 1, 0), Position = UDim2.new(0, 10, 0, 0),
-    BackgroundTransparency = 1, Text = "LOCUS v2.1.1 - audit launcher",
+    BackgroundTransparency = 1, Text = "LOCUS v2.1.2 - audit launcher",
     TextColor3 = C_ACC, Font = FONT, TextSize = 16, TextXAlignment = EnumT.TextXAlignment.Left,
   }, bar)
   mk("TextButton", {
@@ -935,7 +952,7 @@ local function buildGUI(runAudit)
     bufLen = bufLen + #line + 1
     while bufLen > 150000 and #buf > 1 do
       bufLen = bufLen - (#buf[1] + 1)
-      G.table.remove(buf, 1)
+      table.remove(buf, 1)
     end
     logLabel.Text = tconcat(buf, "\n")
   end
@@ -943,7 +960,7 @@ local function buildGUI(runAudit)
   -- wiring
   modeBtn.MouseButton1Click:Connect(function()
     if mode == "url" then mode = "text" else mode = "url" end
-    modeBtn.Text = "SOURCE MODE: " .. G.string.upper(mode)
+    modeBtn.Text = "SOURCE MODE: " .. string.upper(mode)
     urlBox.Visible = (mode == "url")
     srcBox.Visible = (mode == "text")
   end)
@@ -996,7 +1013,7 @@ local function buildGUI(runAudit)
         status.Text = "audit error: " .. tostring_(rec)
       end
     end
-    local taskT = rawget_(G, "task")
+    local taskT = task
     if realType(taskT) == "table" and realType(taskT.spawn) == "function" then
       taskT.spawn(job)
     else
@@ -1009,15 +1026,12 @@ end
 
 -- ================================ ENTRY ====================================
 
-realPrint("[locus] loading LOCUS v2.1.1 ...")
+realPrint("[locus] loading LOCUS v2.1.2 ...")
 
 if EXEC then
-  -- buildGUI signals graceful failure with (false, reason); pcall itself only
-  -- fails on a hard error. Check BOTH, or the fallback run never happens.
-  local okG, guiOk, greason = pcall_(buildGUI, runAudit)
-  if not okG or not guiOk then
-    realPrint("[locus] GUI unavailable ("
-      .. tostring_(okG and greason or guiOk) .. ") - running a default audit instead")
+  local okG, gerr = pcall_(buildGUI, runAudit)
+  if not okG then
+    realPrint("[locus] GUI unavailable (" .. tostring_(gerr) .. ") - running a default audit instead")
     return runAudit(nil) -- GUI failed; default run
   end
   realPrint("[locus] GUI loaded - enter the target and press EXECUTE AUDIT")
