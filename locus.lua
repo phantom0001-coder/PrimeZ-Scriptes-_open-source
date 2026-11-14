@@ -799,6 +799,12 @@ local function buildGUI(runAudit)
       gui.Parent = lp and (lp:FindFirstChildOfClass("PlayerGui") or lp:WaitForChild("PlayerGui"))
     end)
   end
+  -- if every parent refused, say so loudly and fall back to a default run
+  -- instead of building a window nobody can see (silent no-op bug, fixed v2.1.1)
+  if gui.Parent == nil then
+    gui:Destroy()
+    return false, "could not display the GUI (gethui/CoreGui/PlayerGui all refused)"
+  end
 
   local root = mk("Frame", {
     Name = "Root",
@@ -987,17 +993,20 @@ local function buildGUI(runAudit)
     end
   end)
 
-  return true
+  return true, "GUI up"
 end
 
 -- ================================ ENTRY ====================================
 
+realPrint("[locus] loading LOCUS v2.1.1 ...")
+
 if EXEC then
   local okG, gerr = pcall_(buildGUI, runAudit)
   if not okG then
-    realPrint("[locus] GUI unavailable (" .. tostring_(gerr) .. ") - running with defaults")
+    realPrint("[locus] GUI unavailable (" .. tostring_(gerr) .. ") - running a default audit instead")
     return runAudit(nil) -- GUI failed; default run
   end
+  realPrint("[locus] GUI loaded - enter the target and press EXECUTE AUDIT")
   return nil -- GUI is up; the audit starts when EXECUTE AUDIT is pressed
 end
 return runAudit(nil) -- CLI / harness entry
